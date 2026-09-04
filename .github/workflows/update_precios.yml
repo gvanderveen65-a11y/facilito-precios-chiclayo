@@ -14,10 +14,8 @@ jobs:
         with:
           python-version: '3.11'
       - name: Instalar dependencias
-        run: pip install playwright openpyxl
-      - name: Instalar navegador
-        run: playwright install --with-deps chromium
-      - name: Sacar precios y actualizar Excel
+        run: pip install requests openpyxl
+      - name: Descargar precios oficiales y actualizar Excel
         run: python scrape_and_update.py
       - name: Guardar cambios en el repositorio
         run: |
