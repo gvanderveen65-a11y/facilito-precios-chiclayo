@@ -23,7 +23,22 @@ def scrape():
         # (recarga) la misma URL con el departamento ya elegido en sesion.
         with page.expect_navigation(wait_until="load", timeout=30000):
             page.evaluate("makeAction(140000)")  # LAMBAYEQUE
-        page.wait_for_selector('select[name="provincia"] option[value="140100"]', timeout=15000)
+        try:
+            page.wait_for_selector('select[name="provincia"] option[value="140100"]', timeout=15000)
+        except Exception:
+            debug = page.evaluate(
+                """() => ({
+                    url: location.href,
+                    title: document.title,
+                    hasDeptSelect: !!document.querySelector('select[name="departamentoAux"]'),
+                    deptValue: document.querySelector('select[name="departamentoAux"]')?.value,
+                    provinciaOptions: Array.from(document.querySelectorAll('select[name="provincia"] option') || [])
+                        .map(o => o.value + ':' + o.text),
+                    bodyStart: document.body.innerText.slice(0, 500),
+                })"""
+            )
+            print("DEBUG tras fallo esperando provincia:", debug, flush=True)
+            raise
         # Elegir provincia dispara un submit de formulario (navegacion completa).
         with page.expect_navigation(wait_until="load", timeout=30000):
             page.evaluate(
