@@ -1,81 +1,47 @@
-import html
+import io
 import os
-import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
+import requests
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
-from playwright.sync_api import sync_playwright
-URL = "https://www.facilito.gob.pe/facilito/pages/facilito/buscadorEESS.jsp"
+SOURCE_URL = (
+    "https://www.osinergmin.gob.pe/seccion/centro_documental/hidrocarburos/"
+    "SCOP/SCOP-DOCS/2026/Registro-precios/Ultimos-Precios-Registrados-EVPC.xlsx"
+)
 OUT_PATH = "historial/Chiclayo_GasoholRegular_historial.xlsx"
 LIMA = ZoneInfo("America/Lima")
+PROVINCIA_OBJETIVO = "CHICLAYO"
+PRODUCTO_OBJETIVO = "GASOHOL REGULAR"
 FONT_NAME = "Arial"
 HEADER_FILL = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
 HEADER_FONT = Font(name=FONT_NAME, bold=True, color="FFFFFF")
-def scrape():
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        page.goto(URL, wait_until="load", timeout=60000)
-        # La pagina arranca mostrando un mapa (sin <select> en el DOM).
-        # Los enlaces del mapa llaman makeAction(codigoDepartamento), que navega
-        # (recarga) la misma URL con el departamento ya elegido en sesion.
-        with page.expect_navigation(wait_until="load", timeout=30000):
-            page.evaluate("makeAction(140000)")  # LAMBAYEQUE
-        try:
-            page.wait_for_selector('select[name="provincia"] option[value="140100"]', timeout=15000)
-        except Exception:
-            debug = page.evaluate(
-                """() => ({
-                    url: location.href,
-                    title: document.title,
-                    hasDeptSelect: !!document.querySelector('select[name="departamentoAux"]'),
-                    deptValue: document.querySelector('select[name="departamentoAux"]')?.value,
-                    provinciaOptions: Array.from(document.querySelectorAll('select[name="provincia"] option') || [])
-                        .map(o => o.value + ':' + o.text),
-                    bodyStart: document.body.innerText.slice(0, 500),
-                })"""
-            )
-            print("DEBUG tras fallo esperando provincia:", debug, flush=True)
-            raise
-        # Elegir provincia dispara un submit de formulario (navegacion completa).
-        with page.expect_navigation(wait_until="load", timeout=30000):
-            page.evaluate(
-                """() => {
-                    const el = document.querySelector('select[name="provincia"]');
-                    el.value = '140100';  // CHICLAYO
-                    el.dispatchEvent(new Event('change', {bubbles: true}));
-                }"""
-            )
-        # Elegir producto carga la tabla via AJAX en la misma pagina (sin navegar).
-        page.evaluate(
-            """() => {
-                const el = document.querySelector('select[name="producto"]');
-                el.value = '126';  // Gasohol Regular
-                el.dispatchEvent(new Event('change', {bubbles: true}));
-            }"""
-        )
-        page.wait_for_function(
-            "() => window.jQuery && $('table').DataTable && "
-            "$('table').DataTable().rows().data().toArray().length > 0",
-            timeout=30000,
-        )
-        raw = page.evaluate(
-            "() => $('table').DataTable().rows().data().toArray()"
-            ".map(r => Array.isArray(r) ? r : Object.values(r))"
-        )
-        browser.close()
-        return raw
-def clean(raw):
+# El servidor bloquea clientes sin User-Agent de navegador (regla generica del WAF,
+# no es un desafio de comportamiento/captcha) - un User-Agent normal es suficiente.
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+    )
+}
+def descargar_y_filtrar():
+    resp = requests.get(SOURCE_URL, headers=HEADERS, timeout=60)
+    resp.raise_for_status()
+    wb_src = load_workbook(io.BytesIO(resp.content), read_only=True, data_only=True)
+    ws_src = wb_src.active
+    header_row = next(ws_src.iter_rows(min_row=1, max_row=1, values_only=True))
+    idx = {name: i for i, name in enumerate(header_row)}
     records = []
-    for item in raw:
-        distrito = item[0].strip()
-        establecimiento = html.unescape(item[1]).strip()
-        direccion = html.unescape(item[2]).strip()
-        precio_html = item[4]
-        m = re.search(r"([\d.]+)", precio_html)
-        precio = float(m.group(1))
+    for row in ws_src.iter_rows(min_row=2, values_only=True):
+        provincia = row[idx["PROVINCIA"]]
+        producto = row[idx["PRODUCTO"]]
+        if provincia != PROVINCIA_OBJETIVO or producto != PRODUCTO_OBJETIVO:
+            continue
+        distrito = (row[idx["DISTRITO"]] or "").strip()
+        establecimiento = (row[idx["RAZON"]] or "").strip()
+        direccion = (row[idx["DIRECCION"]] or "").strip()
+        precio = float(row[idx["PRECIO_VENTA"]])
         records.append(
             {
                 "Distrito": distrito,
@@ -85,6 +51,7 @@ def clean(raw):
                 "Key": f"{establecimiento}|{direccion}",
             }
         )
+    wb_src.close()
     return records
 def style_header_cell(cell):
     cell.font = HEADER_FONT
@@ -149,11 +116,12 @@ def update_workbook(records, now):
     if "Notas" not in wb.sheetnames:
         wsn = wb.create_sheet("Notas")
         wsn.cell(row=1, column=1, value=(
-            "Fuente: Facilito - Osinergmin (facilito.gob.pe), Diesel y Gasolina > "
-            "Lambayeque > Chiclayo > Gasohol Regular. Precios reportados por los propios "
-            "operadores. Cada hoja mensual (AAAA-MM) contiene una fila por grifo y una "
-            "columna por corrida (encabezado = fecha y hora de la consulta, hora Peru). "
-            "Actualizado automaticamente via GitHub Actions cada 3 horas."
+            "Fuente: Osinergmin - Registro de Precios (PRICE), archivo oficial "
+            "Ultimos-Precios-Registrados-EVPC.xlsx (Provincia Chiclayo, Producto Gasohol "
+            "Regular). Precios reportados por los propios operadores. Cada hoja mensual "
+            "(AAAA-MM) contiene una fila por grifo y una columna por corrida (encabezado "
+            "= fecha y hora de la consulta, hora Peru). Actualizado automaticamente via "
+            "GitHub Actions cada 3 horas."
         )).font = Font(name=FONT_NAME)
         wsn.column_dimensions["A"].width = 100
         wsn.cell(row=1, column=1).alignment = Alignment(wrap_text=True)
@@ -161,8 +129,7 @@ def update_workbook(records, now):
     print(f"Hoja: {sheet_name} | Columna: {col_header} | Grifos: {len(records)}")
 if __name__ == "__main__":
     now = datetime.now(LIMA)
-    raw = scrape()
-    records = clean(raw)
+    records = descargar_y_filtrar()
     if len(records) < 50:
-        raise SystemExit(f"Muy pocos registros ({len(records)}) - probablemente fallo el scraping, no se guarda.")
+        raise SystemExit(f"Muy pocos registros ({len(records)}) - revisar el archivo fuente, no se guarda.")
     update_workbook(records, now)
